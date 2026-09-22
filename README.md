@@ -67,6 +67,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/digests/{id}/variant-analysis` | 对已保存记录施加一组单碱基替换并重跑酶切，返回切口与片段长度差异（不落库，记录不存在返回 404） |
 | `POST` | `/digests/{id}/enzyme-panel-plan` | 枚举候选酶组合，寻找达到目标片段数的最少酶集合（只读不落库，记录不存在返回 404，无解返回 422） |
 | `POST` | `/digests/{id}/partial-digest-distribution` | 为每个已保存物理切口指定独立切割概率，枚举成功/失败状态并返回片段长度多重集的概率分布（只读不落库，记录不存在返回 404） |
+| `POST` | `/digests/{id}/methylation-analysis` | 按酶的敏感偏移分析甲基化对已保存酶切的阻断影响，返回阻断位点、保留/移除切口与重建片段（只读不落库，记录不存在返回 404） |
 | `GET` | `/health` | 健康检查 |
 
 ### 提交示例
@@ -328,6 +329,104 @@ curl -X POST http://localhost:8000/digests/1/partial-digest-distribution \
 | 概率不在 `[0, 1]`（含 `NaN` / 无穷大） | **422** |
 | 已保存切口数超过 12（枚举上限 4096 状态） | **422** |
 
+## 甲基化影响分析
+
+对一次**已保存的完整酶切结果**，给出一组 top 链 **0-based 甲基化坐标**以及
+每种酶的**敏感偏移规则**（识别模式内哪些位置的甲基化会阻断该酶）。服务对已保存
+的每个识别位点计算敏感物理坐标，只要其中**任一位置被甲基化**即判定该位点被
+阻断；同一物理切口仍有未阻断位点时**保留并重算** `enzymes` / `sites`，否则
+**移除**，最后按保留切口重建片段。**分析过程不写库**：原记录保持不变，也不会
+产生新的提交。
+
+> 所有示例中的 `http://localhost:8000` 即 compose 映射的 **8000** 端口；
+> 容器内同样监听 `0.0.0.0:8000`。
+
+### 敏感坐标换算
+
+设识别模式长度为 `k`、位点起点为 `start`（与切口结果中 `sites[].start` 一致）：
+
+| 位点方向 | 敏感物理坐标（top 链 0-based） |
+| --- | --- |
+| 正向 `strand: "+"` | `start + offset` |
+| 反向 `strand: "-"` | `start + k - 1 - offset` |
+
+- 偏移 `offset` 是**识别模式内**的位置，合法范围 **`0 ~ len(pattern)-1`**
+  （只覆盖模式实际占据的碱基）。
+- **环形序列**的物理坐标对序列长度取模，因此跨原点的位点与敏感位置也能正确命中
+  （例如 `start + offset = L` 即位置 `0`）。
+- 给出的甲基化坐标若不落在任何位点的敏感位置上，则不起作用，也不算错误。
+
+### 请求
+
+```bash
+curl -X POST http://localhost:8000/digests/1/methylation-analysis \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "methylated_positions": [5],
+    "enzyme_rules": [
+      {"enzyme": "EcoRI", "sensitive_offsets": [1]}
+    ]
+  }'
+```
+
+- `methylated_positions`：top 链 0-based 甲基化坐标，**至少一个**，不可重复；
+  合法范围为 `[0, 序列长度)`。
+- `enzyme_rules`：**至少一条**规则，同一酶名不可重复：
+  - `enzyme`：酶名，必须是该记录已保存酶切所使用的酶（名称以提交时为准）；
+  - `sensitive_offsets`：模式内敏感偏移列表，**至少一个**，同一规则内不可重复。
+- 酶在记录中没有任何位点时给出其规则是允许的（空操作）。
+
+### 响应
+
+以上例（记录序列 `AAAAGAATTCTTTT`，EcoRI 正向位点起于 4，偏移 1 映射到
+物理位置 5）为例：
+
+```json
+{
+  "id": 1,
+  "topology": "linear",
+  "sequence_length": 14,
+  "methylated_positions": [5],
+  "blocked_sites": [
+    {"enzyme": "EcoRI", "start": 4, "strand": "+", "matched": "GAATTC",
+     "top_cut": 5, "bottom_cut": 9, "blocked_by_positions": [5]}
+  ],
+  "retained_cuts": [],
+  "removed_cuts": [ {"top_cut": 5, "bottom_cut": 9, "...": "（完整切口对象）"} ],
+  "fragments": [
+    {"index": 0, "start": 0, "end": 14, "length": 14,
+     "sequence": "AAAAGAATTCTTTT", "wraps_origin": false, "...": "两端均为 none"}
+  ]
+}
+```
+
+- `blocked_sites[]`：每个被阻断的识别位点（酶、起点、方向、命中序列），附所属
+  物理切口坐标 `top_cut` / `bottom_cut` 以及实际命中的甲基化坐标
+  `blocked_by_positions`（排序去重）。
+- `retained_cuts[]`：仍有未阻断位点而保留下来的物理切口，结构与完整酶切结果中的
+  切口一致；`end_type` / `overhang` 不变（物理切口未移动），`enzymes` / `sites`
+  仅包含存活位点对应的酶与位点。
+- `removed_cuts[]`：位点全部被阻断而移除的物理切口（完整切口对象）。
+- `fragments[]`：由保留切口复用完整酶切的片段逻辑重建，线性/环形的全部规则
+  （端点切口、单切口开环、无切口保留整条环、跨原点片段等）保持一致。
+- **稳定排序**：`methylated_positions` 回显为升序（与传入顺序无关）；
+  `blocked_sites` 按 `(top_cut, bottom_cut, enzyme, start, strand)` 排序；
+  `retained_cuts` / `removed_cuts` 按 `(top_cut, bottom_cut)` 排序；相同请求
+  结果必然一致。
+
+### 校验与状态码
+
+| 情形 | 状态码 |
+| --- | --- |
+| 记录不存在 | **404**（优先于其它校验，不泄露 422 细节） |
+| 甲基化坐标越界（`>= 序列长度`）或为负 | **422** |
+| 甲基化坐标重复 | **422** |
+| 酶名不在已保存记录中 | **422** |
+| 请求内同一酶名给出多条规则 | **422** |
+| 敏感偏移越界（`>= len(pattern)`，含负数） | **422** |
+| 同一规则内偏移重复 | **422** |
+| `methylated_positions` 或 `enzyme_rules` 为空 / 缺失 | **422** |
+
 ## 结果字段约定
 
 - **坐标**：均为 0-based，作用于 top 链（提交序列方向）；切口位置 `c` 表示断裂
@@ -367,6 +466,7 @@ app/
 ├── variant.py   # 变异施加与切口/片段差异对比
 ├── panel.py     # 酶组合面板规划（枚举候选组合、最少酶择优）
 ├── distribution.py  # 部分酶切概率分布（枚举成功/失败状态、长度多重集合并）
+├── methylation.py   # 甲基化阻断分析（敏感偏移映射、切口保留/移除、片段重建）
 ├── iupac.py     # IUPAC 编码表与反向互补
 ├── schemas.py   # 请求/响应模型与校验
 └── db.py        # SQLite 持久化（启动时自动建表）
@@ -375,7 +475,8 @@ tests/
 ├── test_api.py          # 提交/查询/校验 API 测试
 ├── test_variant_api.py  # 变异影响分析 API 测试
 ├── test_panel_api.py    # 酶组合面板规划 API 测试
-└── test_distribution_api.py  # 部分酶切概率分布 API 测试
+├── test_distribution_api.py  # 部分酶切概率分布 API 测试
+└── test_methylation_api.py   # 甲基化影响分析 API 测试
 Dockerfile
 docker-compose.yml
 requirements.txt

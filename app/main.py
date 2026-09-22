@@ -9,6 +9,9 @@
     POST /digests/{id}/partial-digest-distribution
                                            为每个已保存切口指定独立切割概率，枚举成功/失败
                                            状态并返回片段长度多重集的概率分布（只读，不落库）
+    POST /digests/{id}/methylation-analysis
+                                           按敏感偏移分析甲基化对已保存酶切的阻断影响，
+                                           返回阻断位点、保留/移除切口与重建片段（只读，不落库）
     GET  /health                           健康检查
 """
 
@@ -22,6 +25,7 @@ from fastapi import FastAPI, HTTPException
 from .db import Database
 from .digest import run_digest
 from .distribution import MAX_PARTIAL_CUTS, partial_digest_distribution
+from .methylation import methylation_analysis
 from .panel import plan_enzyme_panel
 from .schemas import (
     DigestRequest,
@@ -30,6 +34,8 @@ from .schemas import (
     EnzymeIn,
     EnzymePanelPlanRequest,
     EnzymePanelPlanResponse,
+    MethylationAnalysisRequest,
+    MethylationAnalysisResponse,
     PartialDigestDistributionResponse,
     PartialDigestRequest,
     VariantAnalysisRequest,
@@ -245,4 +251,75 @@ def partial_digest(submission_id: int, request: PartialDigestRequest) -> dict:
         "outcome_count": len(distribution["outcomes"]),
         "total_probability": distribution["total_probability"],
         "outcomes": distribution["outcomes"],
+    }
+
+
+@app.post(
+    "/digests/{submission_id}/methylation-analysis",
+    response_model=MethylationAnalysisResponse,
+)
+def analyze_methylation(submission_id: int, request: MethylationAnalysisRequest) -> dict:
+    # 先确认记录存在：不存在返回 404，且不泄露任何校验细节
+    record = db.get_submission(submission_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"submission {submission_id} not found")
+
+    length = len(record["sequence"])
+
+    # 甲基化坐标越界（[0, length)）依赖记录的序列长度，只能在取到记录后校验 -> 422
+    out_of_bounds = sorted(p for p in request.methylated_positions if p >= length)
+
+    # 酶名须对应记录中实际参与酶切的酶；同名酶重复提交时取其模式长度的最小值
+    # 作为偏移上界，保证任何同方位点（matched 恒等于模式长度）的映射都落在模式内。
+    pattern_length: dict[str, int] = {}
+    for e in record["enzymes"]:
+        k = len(e["pattern"])
+        pattern_length[e["name"]] = min(pattern_length.get(e["name"], k), k)
+
+    unknown_enzymes = sorted(
+        {r.enzyme for r in request.enzyme_rules if r.enzyme not in pattern_length}
+    )
+    bad_offsets = []
+    for r in request.enzyme_rules:
+        bound = pattern_length.get(r.enzyme)
+        if bound is None:
+            continue
+        invalid = sorted(o for o in r.sensitive_offsets if o >= bound)
+        if invalid:
+            bad_offsets.append(
+                f"enzyme '{r.enzyme}': offset(s) out of range [0, {bound - 1}]: "
+                + ", ".join(str(o) for o in invalid)
+            )
+
+    problems = []
+    if out_of_bounds:
+        problems.append(
+            f"methylated positions out of bounds for sequence length {length}: "
+            + ", ".join(str(p) for p in out_of_bounds)
+        )
+    if unknown_enzymes:
+        problems.append("unknown enzyme name(s): " + ", ".join(unknown_enzymes))
+    if bad_offsets:
+        problems.append("; ".join(bad_offsets))
+    if problems:
+        raise HTTPException(status_code=422, detail="; ".join(problems))
+
+    # 仅在内存中评估阻断并重建片段，原记录与数据库均不改动
+    rule_by_enzyme = {
+        r.enzyme: sorted(set(r.sensitive_offsets)) for r in request.enzyme_rules
+    }
+    analysis = methylation_analysis(
+        record["sequence"],
+        record["topology"],
+        record["result"]["cuts"],
+        rule_by_enzyme,
+        request.methylated_positions,
+    )
+
+    return {
+        "id": record["id"],
+        "topology": record["topology"],
+        "sequence_length": length,
+        "methylated_positions": sorted(request.methylated_positions),
+        **analysis,
     }
