@@ -14,8 +14,10 @@ docker compose up --build
 ```
 
 依赖在镜像构建时安装（`pip install -r requirements.txt`），SQLite 数据库在容器
-启动时自动建库建表，无需任何手工步骤。启动后访问 **http://localhost:8000/docs**
-即可看到包含全部接口的交互式文档。
+启动时自动建库建表，无需任何手工步骤。服务监听容器内 **8000** 端口，compose 通过
+`ports: ["8000:8000"]` 映射到宿主机同一端口——启动后直接访问
+**http://localhost:8000/docs** 即可看到包含全部接口的交互式文档（如宿主机 8000
+端口被占用，可把 compose 中映射改为 `8001:8000` 后从 8001 访问）。
 
 其它常用 Docker 操作：
 
@@ -67,6 +69,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/digests/{id}/variant-analysis` | 对已保存记录施加一组单碱基替换并重跑酶切，返回切口与片段长度差异（不落库，记录不存在返回 404） |
 | `POST` | `/digests/{id}/enzyme-panel-plan` | 枚举候选酶组合，寻找达到目标片段数的最少酶集合（只读不落库，记录不存在返回 404，无解返回 422） |
 | `POST` | `/digests/{id}/partial-digest-distribution` | 为每个已保存物理切口指定独立切割概率，枚举成功/失败状态并返回片段长度多重集的概率分布（只读不落库，记录不存在返回 404） |
+| `POST` | `/digests/{id}/methylation-analysis` | 只读分析甲基化对已保存酶切位点的阻断影响：按酶的敏感偏移定位甲基化碱基，阻断/保留/移除切口并重建片段（不落库，记录不存在返回 404） |
 | `GET` | `/health` | 健康检查 |
 
 ### 提交示例
@@ -328,7 +331,130 @@ curl -X POST http://localhost:8000/digests/1/partial-digest-distribution \
 | 概率不在 `[0, 1]`（含 `NaN` / 无穷大） | **422** |
 | 已保存切口数超过 12（枚举上限 4096 状态） | **422** |
 
-## 结果字段约定
+## 甲基化阻断分析
+
+对一次**已保存的完整酶切结果**，给出一组 **top 链 0-based 甲基化坐标**以及每种酶的
+**甲基化敏感偏移规则**，服务在**内存中**评估甲基化对已保存识别位点的阻断效果：
+任一敏感位置被甲基化即阻断该位点；同一物理切口只要还有未阻断的位点就保留（并重算
+其 `enzymes` / `sites`），否则移除；最后由保留切口重建片段。**分析过程不写库**：
+原记录保持不变，也不会产生新的提交。
+
+### 坐标映射
+
+敏感偏移是相对于识别模式 5' 端的 0-based 下标，按位点所在链换算为 top 链物理坐标：
+
+- **正向位点**（`strand: "+"`）：`start + offset`；
+- **反向位点**（`strand: "-"`）：`start + 模式长度 - 1 - offset`；
+- **环形序列**：上述坐标对序列长度取模，因此跨原点位点的偏移也能定位到真实碱基；
+  线性序列不做取模（位点本身不出界）。
+
+位点的任一敏感物理坐标出现在 `methylated_positions` 中，即视为该位点**被阻断**。
+
+### 请求
+
+以下示例假设 `id=1` 的记录序列为 `GAATTCAAAAGAATTC`（线性，两个 EcoRI 位点，
+分别起于 0 和 10，切口 `(1,5)` 与 `(11,15)`；可先通过 `POST /digests` 创建）：
+
+```bash
+curl -X POST http://localhost:8000/digests/1/methylation-analysis \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "methylated_positions": [0],
+    "enzyme_rules": [
+      {"enzyme": "EcoRI", "sensitive_offsets": [0]}
+    ]
+  }'
+```
+
+- `methylated_positions`：**top 链 0-based 物理坐标**列表，至少一个，不可重复；
+  坐标上界为已保存记录的序列长度（越界返回 422）。
+- `enzyme_rules`：至少一条规则，同一酶名不可重复；
+  - `enzyme`：酶名，必须是该记录已保存的酶（未知酶名返回 422）；
+  - `sensitive_offsets`：识别模式内的敏感偏移（0-based），至少一个，合法范围
+    **`0 ~ len(pattern)-1`**（越界返回 422）；同一规则内重复的偏移允许出现，
+    会自动按集合处理。
+- 请求条目的顺序不影响结果（甲基化坐标回显时排序去重）。
+
+### 响应
+
+上例中起于 0 的位点在其偏移 0（物理坐标 0）被甲基化而阻断，切口 `(1,5)` 移除；
+起于 10 的位点不受影响，切口 `(11,15)` 保留，片段由 `[1,10,5]` 重建为 `[11,5]`：
+
+```json
+{
+  "id": 1,
+  "topology": "linear",
+  "sequence_length": 16,
+  "methylated_positions": [0],
+  "blocked_sites": [
+    {
+      "top_cut": 1,
+      "bottom_cut": 5,
+      "site": {"enzyme": "EcoRI", "start": 0, "strand": "+", "matched": "GAATTC"},
+      "methylated_positions": [0]
+    }
+  ],
+  "retained_cuts": [
+    {
+      "top_cut": 11,
+      "bottom_cut": 15,
+      "end_type": "5prime",
+      "overhang": "AATT",
+      "enzymes": ["EcoRI"],
+      "sites": [
+        {"enzyme": "EcoRI", "start": 10, "strand": "+", "matched": "GAATTC"}
+      ]
+    }
+  ],
+  "removed_cuts": [
+    {
+      "top_cut": 1,
+      "bottom_cut": 5,
+      "end_type": "5prime",
+      "overhang": "AATT",
+      "enzymes": ["EcoRI"],
+      "sites": [
+        {"enzyme": "EcoRI", "start": 0, "strand": "+", "matched": "GAATTC"}
+      ]
+    }
+  ],
+  "fragments": [
+    {"index": 0, "start": 0, "end": 11, "length": 11, "sequence": "GAATTCAAAAG",
+     "wraps_origin": false,
+     "left_end": {"type": "none", "overhang": ""},
+     "right_end": {"type": "5prime", "overhang": "AATT"}},
+    {"index": 1, "start": 11, "end": 16, "length": 5, "sequence": "AATTC",
+     "wraps_origin": false,
+     "left_end": {"type": "5prime", "overhang": "AATT"},
+     "right_end": {"type": "none", "overhang": ""}}
+  ]
+}
+```
+
+- `blocked_sites[]`：每个被阻断的识别位点一项，含其所属物理切口坐标、完整位点对象
+  与实际命中的 `methylated_positions`（一个位点可能同时命中多个甲基化坐标）。
+- `retained_cuts[]`：仍存在未阻断位点的物理切口，结构与完整酶切的切口一致，
+  其中 `enzymes` / `sites` 已按存活位点**重新合并去重**。
+- `removed_cuts[]`：全部位点均被阻断而消失的物理切口，回显阻断前的完整切口对象。
+- `fragments[]`：由保留切口复用完整酶切的片段逻辑重建，线性端点切口、环形单切口
+  开环、无切口保留整条环等规则与 `POST /digests` 完全一致。
+- **稳定排序**：`retained_cuts` / `removed_cuts` 按 `(top_cut, bottom_cut)` 排序；
+  `blocked_sites` 按 `(top_cut, bottom_cut, 酶名, 起点, 链)` 排序；片段按起点排序。
+  相同请求（无论列表条目顺序）结果必然一致。
+
+### 校验与状态码
+
+| 情形 | 状态码 |
+| --- | --- |
+| 记录不存在 | **404** |
+| 甲基化坐标越界（`>= 序列长度`，含上界） | **422** |
+| 甲基化坐标为负数 / 重复出现 | **422** |
+| `enzyme_rules` 中出现记录未保存的酶名 | **422** |
+| 同一酶名在 `enzyme_rules` 中重复出现 | **422** |
+| 敏感偏移超出 `[0, len(pattern)-1]`（含负数） | **422** |
+| `methylated_positions` 或 `enzyme_rules` 为空列表 | **422** |
+
+
 
 - **坐标**：均为 0-based，作用于 top 链（提交序列方向）；切口位置 `c` 表示断裂
   位于第 `c-1` 与第 `c` 个碱基之间。片段区间为半开区间 `[start, end)`。
@@ -367,6 +493,7 @@ app/
 ├── variant.py   # 变异施加与切口/片段差异对比
 ├── panel.py     # 酶组合面板规划（枚举候选组合、最少酶择优）
 ├── distribution.py  # 部分酶切概率分布（枚举成功/失败状态、长度多重集合并）
+├── methylation.py   # 甲基化阻断分析（敏感位点定位、切口保留/移除、片段重建）
 ├── iupac.py     # IUPAC 编码表与反向互补
 ├── schemas.py   # 请求/响应模型与校验
 └── db.py        # SQLite 持久化（启动时自动建表）
@@ -375,7 +502,8 @@ tests/
 ├── test_api.py          # 提交/查询/校验 API 测试
 ├── test_variant_api.py  # 变异影响分析 API 测试
 ├── test_panel_api.py    # 酶组合面板规划 API 测试
-└── test_distribution_api.py  # 部分酶切概率分布 API 测试
+├── test_distribution_api.py  # 部分酶切概率分布 API 测试
+└── test_methylation_api.py   # 甲基化阻断分析 API 测试
 Dockerfile
 docker-compose.yml
 requirements.txt

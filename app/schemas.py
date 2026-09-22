@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import math
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -315,4 +315,97 @@ class PartialDigestDistributionResponse(BaseModel):
     outcome_count: int
     total_probability: float
     outcomes: list[PartialDigestOutcome]
+
+
+# ---------- 甲基化阻断分析 ----------
+
+
+class MethylationRuleIn(BaseModel):
+    """一种酶的甲基化敏感规则：识别模式内的敏感偏移（0-based）。
+
+    偏移以识别模式 5' 端为基准，合法范围为 [0, len(pattern) - 1]；
+    上界依赖该酶在已保存记录中的模式长度，因此非负由模型校验、
+    上界在路由取到记录后校验（未知酶名同样依赖记录），越界 -> 422。
+    同一酶在请求中重复出现即 422。
+    """
+
+    enzyme: str = Field(min_length=1, max_length=100, examples=["EcoRI"])
+    sensitive_offsets: list[Annotated[int, Field(ge=0)]] = Field(
+        min_length=1, examples=[[0, 1]]
+    )
+
+    @field_validator("enzyme")
+    @classmethod
+    def _enzyme_name_ok(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("enzyme name must not be blank")
+        return v
+
+
+class MethylationAnalysisRequest(BaseModel):
+    """甲基化阻断分析请求：甲基化坐标（top 链 0-based）+ 酶敏感规则。
+
+    甲基化坐标与酶规则各自不得重复；坐标上界依赖已保存记录的序列长度，
+    越界检查在路由中（取到记录之后）完成，以 422 拒绝。
+    """
+
+    methylated_positions: list[Annotated[int, Field(ge=0)]] = Field(
+        min_length=1, examples=[[4, 5]]
+    )
+    enzyme_rules: list[MethylationRuleIn] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _no_duplicates(self) -> "MethylationAnalysisRequest":
+        problems = []
+
+        seen: set[int] = set()
+        duplicates: set[int] = set()
+        for position in self.methylated_positions:
+            if position in seen:
+                duplicates.add(position)
+            seen.add(position)
+        if duplicates:
+            problems.append(
+                "duplicate methylated positions: "
+                + ", ".join(str(p) for p in sorted(duplicates))
+            )
+
+        seen_enzymes: set[str] = set()
+        duplicate_enzymes: set[str] = set()
+        for rule in self.enzyme_rules:
+            if rule.enzyme in seen_enzymes:
+                duplicate_enzymes.add(rule.enzyme)
+            seen_enzymes.add(rule.enzyme)
+        if duplicate_enzymes:
+            problems.append(
+                "duplicate enzyme rules: "
+                + ", ".join(sorted(duplicate_enzymes))
+            )
+
+        if problems:
+            raise ValueError("; ".join(problems))
+        return self
+
+
+class BlockedSiteOut(BaseModel):
+    """一个被甲基化阻断的识别位点及其命中的甲基化物理坐标。"""
+
+    top_cut: int
+    bottom_cut: int
+    site: SiteOut
+    methylated_positions: list[int]
+
+
+class MethylationAnalysisResponse(BaseModel):
+    """甲基化分析结果：被阻断位点、保留/移除切口与重建片段均稳定排序。"""
+
+    id: int
+    topology: Literal["linear", "circular"]
+    sequence_length: int
+    methylated_positions: list[int]
+    blocked_sites: list[BlockedSiteOut]
+    retained_cuts: list[CutOut]
+    removed_cuts: list[CutOut]
+    fragments: list[FragmentOut]
 
